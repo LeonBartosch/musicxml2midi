@@ -4,8 +4,12 @@ from __future__ import annotations
 import os, sys
 import math
 import numpy as np
-from pathlib import Path
 import hashlib
+
+try:
+    import mido
+except ImportError:
+    mido = None
 
 PROJ_ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
 SRC_DIR = os.path.join(PROJ_ROOT, "src")
@@ -42,6 +46,92 @@ from musicxml2midi.gui.settings import SettingsDialog
 from musicxml2midi.gui.settings import load_config as load_gui_config
 
 # ---------- helpers ----------
+# Hilfsfunktionen ans Ende des Files (noch vor MainWindow-Klasse oder als @staticmethods)
+
+def _mk_seconds_to_ticks(bundle: TimelineBundle):
+    return seconds_to_ticks_map(bundle.conductor.tempos, bundle.ticks_per_beat)
+
+def _events_from_song(song: MidiSong, bundle: TimelineBundle, channel: int = 0):
+    """Baue absolute Tick-Events [(tick, priority, mido.Message/meta)].
+    priority: kleinere Zahl = früher; sorgt für sinnvolle Reihenfolge bei gleiche tick.
+    """
+    s2t = _mk_seconds_to_ticks(bundle)
+    evts = []
+
+    # 1) Notes
+    for n in (song.notes or []):
+        st = int(s2t(float(n.start)))
+        en = int(s2t(float(n.end)))
+        vel = int(max(1, min(127, int(n.velocity))))
+        pitch = int(n.pitch)
+        evts.append((st, 20, mido.Message('note_on',  note=pitch, velocity=vel, channel=channel)))
+        evts.append((max(en, st+1), 90, mido.Message('note_off', note=pitch, velocity=0,   channel=channel)))
+
+    # 2) CCs aus song.meta["cc"] (Keys sind CC-Nummern, Werte [(sec, val)])
+    cc_map = (song.meta or {}).get("cc") or {}
+    for cc_num, pts in cc_map.items():
+        for t_sec, val in pts:
+            tick = int(s2t(float(t_sec)))
+            evts.append((tick, 40, mido.Message('control_change', control=int(cc_num), value=int(val), channel=channel)))
+
+    return evts
+
+def _conductor_events(bundle: TimelineBundle):
+    """Tempo- und Taktwechsel als absolute Tick-Events."""
+    tpb = int(bundle.ticks_per_beat)
+    evts = []
+    # Tempi: [(tick, bpm)]
+    for tick, bpm in sorted(bundle.conductor.tempos, key=lambda x: x[0]):
+        tempo = mido.bpm2tempo(float(bpm))  # microsec per beat
+        evts.append((int(tick), 0, mido.MetaMessage('set_tempo', tempo=int(tempo))))
+    # Time signatures: [(tick, num, den)]
+    for tick, num, den in sorted(bundle.conductor.timesigs, key=lambda x: x[0]):
+        evts.append((int(tick), 0, mido.MetaMessage('time_signature', numerator=int(num), denominator=int(den))))
+    return evts
+
+def _build_midifile_for_song(song: MidiSong, bundle: TimelineBundle, add_conductor_meta: bool = False, channel: int = 0) -> 'mido.MidiFile':
+    mf = mido.MidiFile(ticks_per_beat=int(bundle.ticks_per_beat))
+    tr = mido.MidiTrack(); mf.tracks.append(tr)
+
+    evts = []
+    if add_conductor_meta:
+        evts += _conductor_events(bundle)
+    evts += _events_from_song(song, bundle, channel=channel)
+
+    # sortieren: (tick, priority, msg)
+    evts.sort(key=lambda x: (x[0], x[1]))
+    # in Delta konvertieren
+    last = 0
+    for tick, _prio, msg in evts:
+        delta = int(max(0, tick - last))
+        msg.time = delta
+        tr.append(msg)
+        last = tick
+
+    return mf
+
+def _build_midifile_for_conductor_only(bundle: TimelineBundle) -> 'mido.MidiFile':
+    mf = mido.MidiFile(ticks_per_beat=int(bundle.ticks_per_beat))
+    tr = mido.MidiTrack(); mf.tracks.append(tr)
+    evts = _conductor_events(bundle)
+    evts.sort(key=lambda x: (x[0], x[1]))
+    last = 0
+    for tick, _prio, msg in evts:
+        delta = int(max(0, tick - last))
+        msg.time = delta
+        tr.append(msg)
+        last = tick
+    return mf
+
+def _sanitize_basename(name: str, fallback: str = "export") -> str:
+    # Extension weg, Leerraum trimmen
+    base = os.path.splitext(name or "")[0].strip()
+    # nur sichere Zeichen erlauben
+    base = "".join(c if (c.isalnum() or c in " _-.") else "_" for c in base)
+    # unschöne Ränder entfernen
+    base = base.strip().strip("._-")
+    return base or fallback
+
 def _segment_mean(ticks: np.ndarray, L: np.ndarray, t0: int, t1: int) -> float:
     i0 = int(np.searchsorted(ticks, t0, side="left"))
     i1 = int(np.searchsorted(ticks, t1, side="right"))
@@ -227,7 +317,7 @@ def build_song_from_bundle(bundle: TimelineBundle, part: TrackTimeline,
             curr_evs = onsets[t]
             curr_start_sum = sum(int(e.attrs.get("slur_start_n", 0)) for e in curr_evs)
             curr_stop_sum  = sum(int(e.attrs.get("slur_stop_n",  0)) for e in curr_evs)
-            place_slur_here = (have_prev and slur_depth > 0 and curr_start_sum == 0)
+            place_slur_here = (have_prev and slur_depth > 0)
 
             onset_tags = set()
             for ev in curr_evs:
@@ -424,17 +514,37 @@ def _apply_slur_legato(song: MidiSong, bundle: TimelineBundle, phrasing_cfg: Dic
     t2s = ticks_to_seconds_map(bundle.conductor.tempos, tpb)
     s2t = seconds_to_ticks_map(bundle.conductor.tempos, tpb)
 
-    # Optionen:
-    # - Feste Mindest-Überlappung in Ticks …
-    min_ov_ticks_abs = int(sl.get("overlap_ticks", 0))
-    # - … oder relativ zur *vorherigen* Notenlänge (setzt sich obendrauf)
-    max_adv_frac_prev = float(sl.get("max_advance_frac_of_prev_len", 0.50))  # z.B. 50%
+    def _bpm_at(tick: int) -> float:
+        bpm = 120.0
+        for tt, b in bundle.conductor.tempos:
+            if tt <= tick: bpm = float(b)
+            else: break
+        return bpm
 
-    # Frühstart weiterhin erlaubt, aber an Onset-Fenster geklemmt (optional)
-    early_abs = int(((sl.get("early_start") or {}).get("abs_ticks", 0)))
-    early_rel = float(((sl.get("early_start") or {}).get("rel_of_len", 0.0)))  # relativ zur EIGENEN Länge!
+    def _sec_per_tick_at(tick: int) -> float:
+        return (60.0 / _bpm_at(tick)) / float(tpb)
+
+    # ---- Config (rein relativ) ----
+    early_cfg = (sl.get("early_start") or {})
+    early_ms  = early_cfg.get("ms", 0)  # zusätzlicher absoluter Offset; darf 0 sein
+
+    max_adv_ms = early_cfg.get("max_advance_ms", sl.get("max_advance_ms", None))
+    longest_note_ms = early_cfg.get("longest_note_ms", sl.get("longest_note_ms", None))
+    max_adv_frac_prev = float(sl.get("max_advance_frac_of_prev_len", sl.get("max_advance_frac_of_prev_len", 0.50)))
+
     guard_prev = int(sl.get("guard_prev_onset_ticks", 0))
     guard_next = int(sl.get("guard_next_onset_ticks", 0))
+
+    overlap_ticks = int(sl.get("overlap_ticks", 0))
+    overlap_ms    = sl.get("overlap_ms", None)
+
+    non_slur_gap_ticks = int(sl.get("non_slur_min_gap_ticks", 0))
+    tenuto_gap_ticks   = int(sl.get("tenuto_min_gap_ticks", 0))
+    non_slur_gap_ms    = sl.get("non_slur_min_gap_ms", None)
+    tenuto_gap_ms      = sl.get("tenuto_min_gap_ms", None)
+
+    # --- NEU: Obergrenze für die Länge, auf die rel_of_len wirkt (in ms)
+    longest_note_ms = sl.get("longest_note_ms", None)
 
     # Kopie
     notes: List[Note] = []
@@ -450,78 +560,119 @@ def _apply_slur_legato(song: MidiSong, bundle: TimelineBundle, phrasing_cfg: Dic
     for nn in notes:
         by_vkey[nn._vkey].append(nn)
 
-    # 2a) Frühstart NUR für die aktuelle Slur-Note (B):
-    #     shift_B = early_abs + early_rel * len(B)
-    #     Danach zwischen Nachbarstarts mit Guards klemmen.
+    # 2a) Frühstart nur für Slur-Zielnote
     for vkey, arr in by_vkey.items():
         arr.sort(key=lambda x: x.orig_onset_tick)
         for i, cur in enumerate(arr):
-            st = cur.start_tick
-            en = cur.end_tick
             if "slur" not in (cur.articulations or []):
                 continue
 
-            # Roh-Shift (bezogen auf B selbst)
-            own_len = max(1, en - st)
-            raw_shift = max(0, early_abs + int(round(early_rel * own_len)))
+            st = cur.start_tick
+            en = cur.end_tick
+            own_len_ticks = max(1, en - st)
 
-            # Deckel relativ zu A
+            spt = _sec_per_tick_at(st)
+
+            def ms_to_ticks(ms: float) -> int:
+                return int(round((ms / 1000.0) / spt))
+
+            own_len_ticks = max(1, en - st)
+            spt = _sec_per_tick_at(st)  # sek pro tick an dieser Stelle
+
+            def ms_to_ticks(ms: float) -> int:
+                return int(round((ms / 1000.0) / spt))
+
+            # ---- NEU: rein relative Advance-Formel in ms ----
+            # L_eff = min(L_ms, longest_note_ms)
+            # A_ms  = max_advance_ms * (L_eff / longest_note_ms)
+            adv_ms_rel = 0.0
+            if (max_adv_ms is not None) and (longest_note_ms is not None) and (longest_note_ms > 0):
+                own_len_ms = own_len_ticks * spt * 1000.0
+                L_eff = min(float(own_len_ms), float(longest_note_ms))
+                adv_ms_rel = float(max_adv_ms) * (L_eff / float(longest_note_ms))
+
+            # zusätzlicher absoluter Offset (kann 0 sein)
+            adv_ms_total = max(0.0, float(early_ms) + float(adv_ms_rel))
+
+            base_shift_ticks = ms_to_ticks(adv_ms_total)
+
+            # ---- Caps (wie gehabt) ----
             if i > 0:
                 prev = arr[i-1]
                 prev_len = max(1, prev.end_tick - prev.start_tick)
                 cap_by_prev = int(round(max_adv_frac_prev * prev_len))
-                applied_shift = min(raw_shift, cap_by_prev)
             else:
-                applied_shift = raw_shift
+                cap_by_prev = base_shift_ticks
 
+            cap_by_ms = ms_to_ticks(float(max_adv_ms)) if (max_adv_ms is not None) else base_shift_ticks
+
+            applied_shift = min(base_shift_ticks, cap_by_prev, cap_by_ms)
+
+            # Fenster-Guards und Anwenden
             cand = st - applied_shift
-
-            # Fenster (Guards): nicht vor prev.start + guard_prev, nicht nach next.start - guard_next
             prev_st = (arr[i-1].start_tick + guard_prev) if i > 0 else None
             next_st = (arr[i+1].start_tick - guard_next) if i+1 < len(arr) else None
-            if prev_st is not None:
-                cand = max(cand, prev_st)
-            if next_st is not None:
-                cand = min(cand, next_st)
+            if prev_st is not None: cand = max(cand, prev_st)
+            if next_st is not None: cand = min(cand, next_st)
 
             cur.start_tick = max(0, cand)
             cur.start = t2s(cur.start_tick)
 
-    # 2b) Exakten Overlap nachziehen: A.end = B.start + overlap_ticks (falls B geslurt, Pitch !=)
+    # 2b) Exakter Overlap: ms > ticks
     for vkey, arr in by_vkey.items():
         arr.sort(key=lambda x: x.start_tick)
         for i in range(1, len(arr)):
             prev, cur = arr[i-1], arr[i]
             if "slur" in (cur.articulations or []) and int(prev.pitch) != int(cur.pitch):
-                # exakt overlap_ticks einstellen (kann verlängern oder kürzen)
-                new_pen = max(prev.start_tick + 1, cur.start_tick + min_ov_ticks_abs)
+                spt_prev = _sec_per_tick_at(prev.start_tick)
+                def ms_to_ticks_local(ms: float) -> int:
+                    return int(round((ms / 1000.0) / spt_prev))
+
+                # -> wenn overlap_ms gesetzt, hat es Vorrang
+                min_ov_ticks_abs = (
+                    ms_to_ticks_local(float(overlap_ms))
+                    if (overlap_ms is not None)
+                    else int(overlap_ticks)
+                )
+
+                new_pen = max(prev.start_tick + 1, cur.start_tick + max(0, min_ov_ticks_abs))
                 if new_pen != prev.end_tick:
                     prev.end_tick = new_pen
                     prev.end = t2s(prev.end_tick)
 
-    # 2c) Gleicher Pitch: kein Overlap, Mindestabstand per Kürzen von A
-    non_slur_gap = int(sl.get("non_slur_min_gap_ticks", 0))
-    tenuto_gap   = int(sl.get("tenuto_min_gap_ticks", 0))
-
+    # 2c) Gleicher Pitch: Mindestabstände, ms > ticks
     by_vkey_pitch: DefaultDict[Tuple[tuple, int], List[Note]] = defaultdict(list)
     for nn in notes:
-        vkey = getattr(nn, "_vkey", ("", ""))   # (voice, staff)
+        vkey = getattr(nn, "_vkey", ("", ""))
         by_vkey_pitch[(vkey, int(nn.pitch))].append(nn)
 
     for arr in by_vkey_pitch.values():
         arr.sort(key=lambda x: x.start_tick)
         for i in range(len(arr) - 1):
             a, b = arr[i], arr[i+1]
+
+            spt_a = _sec_per_tick_at(a.start_tick)
+            def ms_to_ticks_a(ms: float) -> int:
+                return int(round((ms / 1000.0) / spt_a))
+
+            non_slur_gap = (
+                ms_to_ticks_a(float(non_slur_gap_ms))
+                if (non_slur_gap_ms is not None)
+                else int(non_slur_gap_ticks)
+            )
+            tenuto_gap = (
+                ms_to_ticks_a(float(tenuto_gap_ms))
+                if (tenuto_gap_ms is not None)
+                else int(tenuto_gap_ticks)
+            )
+
             arts_a = set(a.articulations or [])
             gap_needed = tenuto_gap if "tenuto" in arts_a else non_slur_gap
             if gap_needed <= 0:
                 continue
 
-            # Ziel: b.start_tick >= a.end_tick + gap_needed
-            # → B NICHT bewegen, stattdessen A kürzen, falls nötig
             desired_end = b.start_tick - gap_needed
             if a.end_tick > desired_end:
-                # A bis maximal desired_end kürzen, aber Mindestlänge 1 Tick lassen
                 a.end_tick = max(a.start_tick + 1, desired_end)
                 a.end = t2s(a.end_tick)
 
@@ -626,15 +777,8 @@ def _apply_interpretation(bundle: TimelineBundle,
     # ---------- 1b) Slur-Vorziehen → Velocity (mit wählbarer Skalierung) ----------
     slv = ((cfg.get("velocities") or {}).get("slur_advance_velocity")) or {}
     fullscale_ms = int(slv.get("fullscale_ms", 160))
-    fullscale_frac = float(slv.get("rel_of_len_fullscale", 0.10))
     sav_enabled   = bool(slv.get("enabled", True))
     include_first = bool(slv.get("include_first_note", False))
-
-    # NEU: Skalierungsarten, damit sich die Längen nicht „rauskürzen“
-    scale_mode = str(slv.get("scale_mode", "absolute")).lower()   # "absolute" | "by_prev_len" | "by_own_len"
-    # absolute:   teilst durch feste Tick-Skala ⇒ Vorziehen in Ticks wirkt 1:1
-    # by_prev_len: teilst durch (Frac * Länge der VORHERIGEN Note)
-    # by_own_len:  (alte Logik) teilst durch (Frac * EIGENE Länge) ⇒ kann konstante norm erzeugen
 
     v_min = int(slv.get("min_vel", 31))    # viel Advance → leise
     v_max = int(slv.get("max_vel", 105))   # wenig Advance → laut
@@ -653,23 +797,18 @@ def _apply_interpretation(bundle: TimelineBundle,
             st_tim = int(getattr(n_tim, "start_tick", st_leg)) # vor Slur
             adv_ticks = max(0, st_tim - st_leg)                # tatsächlicher Vorziehwert in Ticks
 
-            # ---- Skalierung wählen
-            if scale_mode == "absolute":
-                def _bpm_at(tick: int):
-                    bpm = 120.0
-                    for tt, b in bundle.conductor.tempos:
-                        if tt <= tick: bpm = b
-                        else: break
-                    return float(bpm)
+            def _bpm_at(tick: int):
+                bpm = 120.0
+                for tt, b in bundle.conductor.tempos:
+                    if tt <= tick: bpm = b
+                    else: break
+                return float(bpm)
 
-                bpm_here = _bpm_at(st_tim)
-                sec_per_tick = (60.0 / bpm_here) / tpb
-                denom_ticks = max(1, int(round((fullscale_ms / 1000.0) / sec_per_tick)))
-            else:
-                own_len_pre = max(1, int(getattr(n_tim, "end_tick", st_tim+1)) - st_tim)
-                denom_ticks = max(1, int(round(fullscale_frac * own_len_pre)))
-
+            bpm_here = _bpm_at(st_tim)
+            sec_per_tick = (60.0 / bpm_here) / tpb
+            denom_ticks = max(1, int(round((fullscale_ms / 1000.0) / sec_per_tick)))
             norm = adv_ticks / float(denom_ticks)
+
             if gamma != 1.0:
                 norm = norm ** gamma
             norm = 0.0 if norm < 0.0 else (1.0 if norm > 1.0 else norm)
@@ -797,7 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Controls-Reihe
         ctrl = QtWidgets.QHBoxLayout()
         ctrl.setContentsMargins(4, 2, 4, 2)
-        ctrl.addWidget(QtWidgets.QLabel("Curves:"))
+        ctrl.addWidget(QtWidgets.QLabel("Interpretation → MIDI"))
 
         self.chk_show_L     = QtWidgets.QCheckBox("L (Dynamics)")
         self.chk_show_P     = QtWidgets.QCheckBox("P (Phrase)")
@@ -840,9 +979,7 @@ class MainWindow(QtWidgets.QMainWindow):
         post_v = QtWidgets.QVBoxLayout(post_box)
         post_v.setContentsMargins(0,0,0,0)
         post_hdr = QtWidgets.QHBoxLayout()
-        post_hdr.addWidget(QtWidgets.QLabel("Interpretation → MIDI"))
         post_hdr.addStretch(1)
-        post_hdr.addWidget(self.post.cc_selector_widget())
         post_v.addLayout(post_hdr)
         post_v.addWidget(self.post, 1)
 
@@ -909,6 +1046,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_open(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open MusicXML", "", "MusicXML (*.musicxml *.xml)")
         if not path: return
+        self._last_xml_path = path
         self.load_file(path)
 
     def load_file(self, path: str):
@@ -951,6 +1089,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         from os.path import basename
         self.status.showMessage(f"Loaded {basename(path)} | parts={len(self.parts_order)}", 5000)
+
+        self.btn_export.setEnabled(True)
 
     def on_select_part(self):
         row = self.part_list.currentRow()
@@ -1081,9 +1221,101 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cc_plot.plot(xs, preview, pen=pg.mkPen(color, width=2))
 
     def on_export(self):
-        # Platzhalter – folgt später
-        QtWidgets.QMessageBox.information(self, "Export MIDI", "Export folgt bald 🙂")
-        return
+        if mido is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Export MIDI",
+                "Das Paket 'mido' ist nicht installiert.\n\nInstalliere es z.B. mit:\n    pip install mido python-rtmidi"
+            )
+            return
+
+        if not self.bundle or not self.parts_order:
+            QtWidgets.QMessageBox.information(self, "Export MIDI", "Kein Projekt geladen.")
+            return
+
+        # --- Basename & Zielordner in EINEM Dialog (Speichern) auswählen ---
+        default_base = "export"
+        if hasattr(self, "_last_xml_path") and self._last_xml_path:
+            default_base = os.path.splitext(os.path.basename(self._last_xml_path))[0]
+
+        # optional: letztes Verzeichnis merken (oder nimm os.getcwd())
+        start_dir = os.path.dirname(getattr(self, "_last_xml_path", "")) or os.getcwd()
+        default_path = os.path.join(start_dir, f"{default_base}.mid")
+
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Basename & Ziel wählen", default_path, "MIDI (*.mid);;Alle Dateien (*)"
+        )
+        if not fname:
+            return
+
+        out_dir = os.path.dirname(fname)
+        base_in = os.path.splitext(os.path.basename(fname))[0]  # ohne .mid
+        base = _sanitize_basename(base_in, fallback=default_base)
+
+        would_overwrite = []
+        if os.path.exists(os.path.join(out_dir, f"{base}_conductor.mid")):
+            would_overwrite.append(f"{base}_conductor.mid")
+        for idx, pid in enumerate(self.parts_order):
+            track = self.bundle.tracks[pid]
+            safe_name = "".join(c if c.isalnum() or c in " _-." else "_" for c in (track.name or f"part_{idx+1}")).strip().strip("._-") or f"part_{idx+1}"
+            fname_part = f"{base}_{idx+1:02d}_{safe_name}.mid"
+            if os.path.exists(os.path.join(out_dir, fname_part)):
+                would_overwrite.append(fname_part)
+
+        if would_overwrite:
+            reply = QtWidgets.QMessageBox.question(
+                self, "Dateien überschreiben?",
+                "Folgende Dateien existieren bereits und würden überschrieben:\n\n" + "\n".join(would_overwrite) + "\n\nFortfahren?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+        # 1) Conductor-Datei
+        try:
+            mf_cond = _build_midifile_for_conductor_only(self.bundle)
+            cond_path = os.path.join(out_dir, f"{base}_conductor.mid")
+            mf_cond.save(cond_path)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Export MIDI", f"Conductor-Export fehlgeschlagen:\n{e}")
+
+        # 2) Alle Parts – jeweils interpretieren und speichern
+        errors = []
+        for idx, pid in enumerate(self.parts_order):
+            try:
+                track = self.bundle.tracks[pid]
+                dyns  = self.dyn_by_part.get(pid, [])
+                wedges = self.wedges_by_part.get(pid, [])
+
+                analysis_song = build_song_from_bundle(self.bundle, track, dyns, wedges)
+                post_song = _apply_interpretation(
+                    bundle=self.bundle,
+                    track=track,
+                    analysis_song=analysis_song,
+                    dyn_events=dyns,
+                    wedge_spans=wedges,
+                    cfg=self.cfg_data,
+                )
+
+                mf = _build_midifile_for_song(post_song, self.bundle, add_conductor_meta=False, channel=0)
+
+                # Dateiname: <base>_<NN>_<Partname>.mid (sicher gemacht)
+                safe_name = "".join(
+                    c if c.isalnum() or c in " _-." else "_"
+                    for c in (track.name or f"part_{idx+1}")
+                ).strip().strip("._-") or f"part_{idx+1}"
+                fname = f"{base}_{idx+1:02d}_{safe_name}.mid"
+                out_path = os.path.join(out_dir, fname)
+                mf.save(out_path)
+            except Exception as e:
+                errors.append(f"{track.name}: {e}")
+
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self, "Export MIDI",
+                "Einige Dateien konnten nicht exportiert werden:\n\n" + "\n".join(errors)
+            )
+        else:
+            QtWidgets.QMessageBox.information(self, "Export MIDI", "Export finished.")
 
 def main():
     pg.setConfigOptions(antialias=True)

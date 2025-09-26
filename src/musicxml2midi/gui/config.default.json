@@ -4,20 +4,20 @@
   "velocities": {
     "enabled": true,
     "beat_accent": {
-      "enabled": false,
+      "enabled": true,
       "clamp_min": 1,
       "clamp_max": 127,
       "rules": {
-        "bar_downbeat":   {"mul": 1.00, "add": 0},
-        "midbar_strong":  {"mul": 1.00, "add": 0},
-        "onbeats_other":  {"mul": 1.00, "add": 0},
-        "eighth_offbeats":{"mul": 1.00, "add": 0},
-        "sixteenth_offs": {"mul": 1.00, "add": 0},
-        "fallback":       {"mul": 1.00, "add": 0}
+        "bar_downbeat":   {"mul": 1.00, "add": 8},
+        "midbar_strong":  {"mul": 1.00, "add": 5},
+        "onbeats_other":  {"mul": 1.00, "add": 2},
+        "eighth_offbeats":{"mul": 0.95, "add": 0},
+        "sixteenth_offs": {"mul": 0.90, "add": -2},
+        "fallback":       {"mul": 0.90, "add": -4}
       }
     },
     "humanize": {
-      "enabled": false,
+      "enabled": true,
       "seed": 42,
       "mul_jitter": 0.10,
       "add_jitter": 3
@@ -25,11 +25,9 @@
     "slur_advance_velocity": {
       "enabled": true,
       "include_first_note": false,
-      "rel_of_len_fullscale": 0.10,
-      "scale_mode": "absolute",
-      "fullscale_ms": 200,
-      "min_vel": 15,
-      "max_vel": 118,
+      "fullscale_ms": 170,
+      "min_vel": 1,
+      "max_vel": 127,
       "gamma": 1.0,
       "mix_old": 0.2
     }
@@ -37,8 +35,8 @@
   "timing": {
     "enabled": true,
     "seed": 43,
-    "onset_jitter_frac_of_len": 0.10,
-    "dur_jitter_frac_of_len":   0.05,
+    "onset_jitter_frac_of_len": 0.05,
+    "dur_jitter_frac_of_len":   0.03,
     "onset_guard_prev_ticks": 0,
     "onset_guard_next_ticks": 0
   },
@@ -48,8 +46,9 @@
       "overlap_ticks": 30,
       "max_advance_frac_of_prev_len": 0.50,
       "early_start": {
-        "abs_ticks": 0,
-        "rel_of_len": 0.1
+        "ms": 0,
+        "max_advance_ms": 170,
+        "longest_note_ms": 800
       },
       "non_slur_min_gap_ticks": 50,
       "tenuto_min_gap_ticks": 25

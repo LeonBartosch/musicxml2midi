@@ -25,9 +25,6 @@ class PostPanel(QtWidgets.QWidget):
     Unteres Panel: Interpretation -> MIDI
       - große Piano-Roll (Velocity-Färbung)
       - Velocity-Lane (fixe Balkenbreite)
-      - eine CC-Lane (Dropdown, Default CC1)
-    Wenn embedded_controls=True, wird KEINE eigene Controlleiste angezeigt;
-    stattdessen kann cc_selector_widget() extern neben eine Überschrift gesetzt werden.
     """
     def __init__(self, parent=None, embedded_controls: bool = False):
         super().__init__(parent)
@@ -40,40 +37,6 @@ class PostPanel(QtWidgets.QWidget):
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-
-        # CC-Auswahl
-        self._cc_widget = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(self._cc_widget); h.setContentsMargins(0,0,0,0); h.setSpacing(6)
-        h.addWidget(QtWidgets.QLabel("CC:"))
-        self.ccCombo = QtWidgets.QComboBox()
-        h.addWidget(self.ccCombo)
-
-        def _fill_ccs(combo: QtWidgets.QComboBox, default: int):
-            labels = [
-                (1,  "1  (Modulation)"),
-                (2,  "2  (Breath)"),
-                (7,  "7  (Volume)"),
-                (10, "10 (Pan)"),
-                (11, "11 (Expression)"),
-                (64, "64 (Sustain)"),
-                (67, "67 (Soft Pedal)"),
-            ]
-            for num, txt in labels:
-                combo.addItem(txt, userData=num)
-            for n in range(128):
-                if all(combo.itemData(i) != n for i in range(combo.count())):
-                    combo.addItem(str(n), userData=n)
-            for i in range(combo.count()):
-                if combo.itemData(i) == default:
-                    combo.setCurrentIndex(i); break
-
-        _fill_ccs(self.ccCombo, 1)
-
-        # Nur anzeigen, wenn nicht embedded
-        if not self._embedded:
-            ctl = QtWidgets.QHBoxLayout(); ctl.setContentsMargins(0,0,0,0)
-            ctl.addWidget(self._cc_widget); ctl.addStretch(1)
-            root.addLayout(ctl)
 
         # Graphics
         self.gw = pg.GraphicsLayoutWidget()
@@ -97,32 +60,13 @@ class PostPanel(QtWidgets.QWidget):
         self.vel_plot.setMaximumHeight(90)
         self.vel_plot.setMouseEnabled(x=True, y=False)
 
-        # 2) CC
-        self.cc_plot = self.gw.addPlot(row=2, col=0, viewBox=GestureViewBox(zoom_axes="x", allow_y_pan=False))
-        self.cc_plot.hideButtons(); self.cc_plot.setMenuEnabled(False)
-        self.cc_plot.getAxis('bottom').setStyle(showValues=False)
-        self.cc_plot.getAxis('left').setStyle(showValues=False)
-        self.cc_plot.setMaximumHeight(90)
-        self.cc_plot.setMouseEnabled(x=True, y=False)
-
         # X-Link
         self.vel_plot.setXLink(self.roll)
-        self.cc_plot.setXLink(self.roll)
 
         # Stores
         self._grid_roll: List[pg.InfiniteLine] = []
         self._grid_vel:  List[pg.InfiniteLine] = []
-        self._grid_cc:   List[pg.InfiniteLine] = []
         self._vel_items: List[pg.GraphicsObject] = []
-        self._cc_items:  List[pg.GraphicsObject] = []
-
-        # Callbacks
-        self.ccCombo.currentIndexChanged.connect(self._render_cc)
-
-    # --- Embedding helper ---
-    def cc_selector_widget(self) -> QtWidgets.QWidget:
-        """Kleines Widget „CC: [Dropdown]“ zum Einbetten in Header-Leisten."""
-        return self._cc_widget
 
     # ---- Public API ----
     def set_song(self, song: MidiSong):
@@ -137,7 +81,6 @@ class PostPanel(QtWidgets.QWidget):
 
         self._render_roll()
         self._render_velocity_lane()
-        self._render_cc()
         self._render_grid()
 
     # ---- Rendering ----
@@ -188,69 +131,8 @@ class PostPanel(QtWidgets.QWidget):
             self.vel_plot.addItem(curve)
             self._vel_items.append(curve)
 
-    def _cc_values(self, cc_num: int) -> List[Tuple[float,int]]:
-        if not self._song: return []
-        cc_map: Dict[int, List[Tuple[float,int]]] = self._song.meta.get("cc") or {}
-        return sorted(cc_map.get(cc_num, []), key=lambda x: x[0])
-
-    def _render_cc(self):
-        # alte Items entfernen
-        for it in self._cc_items:
-            try:
-                self.cc_plot.removeItem(it)
-            except Exception:
-                pass
-        self._cc_items.clear()
-
-        self.cc_plot.setYRange(0, 127)
-        song = getattr(self, "_song", None)
-        self.cc_plot.setXRange(0, max(3.0, song.length if song else 0.0))
-        if not song:
-            return
-
-        cc_num = self.ccCombo.currentData()
-        if cc_num is None:
-            cc_num = 1
-        cc_num = int(cc_num)
-
-        pts = self._cc_values(cc_num)  # [(time, value)]
-        if not pts:
-            return
-
-        # sortieren + aufeinanderfolgende identische Punkte entfernen
-        pts = sorted(pts, key=lambda x: x[0])
-        clean = []
-        for t, v in pts:
-            if not clean or (abs(t - clean[-1][0]) > 1e-9 or int(v) != int(clean[-1][1])):
-                clean.append((float(t), int(v)))
-        if not clean:
-            return
-
-        times = [t for (t, _v) in clean]
-        vals  = [int(v) for (_t, v) in clean]
-
-        # stepMode=True: x braucht eine Kante mehr als y
-        end_time = float(song.length) if song.length else (times[-1] + 1.0)
-        last_edge = end_time if end_time > times[-1] else (times[-1] + 1e-6)
-        xs = times + [last_edge]
-        ys = vals  # gleiche Länge wie 'vals'
-
-        pen = pg.mkPen(210, 240, 200, 230, width=2)
-
-        # Kurve (Treppenfunktion)
-        curve = pg.PlotCurveItem(xs, ys, stepMode=True, pen=pen)
-        self.cc_plot.addItem(curve)
-        self._cc_items.append(curve)
-
-        # Marker: hier NICHT xs/ys nehmen, sondern times/vals (gleiche Länge!)
-        scat = pg.ScatterPlotItem(times, vals, size=6,
-                                brush=pg.mkBrush(210, 240, 200),
-                                pen=pg.mkPen(60, 90, 60))
-        self.cc_plot.addItem(scat)
-        self._cc_items.append(scat)
-
     def _render_grid(self):
-        for coll, plot in ((self._grid_roll, self.roll), (self._grid_vel, self.vel_plot), (self._grid_cc, self.cc_plot)):
+        for coll, plot in ((self._grid_roll, self.roll), (self._grid_vel, self.vel_plot)):
             for it in coll:
                 try: plot.removeItem(it)
                 except Exception: pass
@@ -270,4 +152,3 @@ class PostPanel(QtWidgets.QWidget):
 
         self._grid_roll = add_lines(self.roll,     self._song.beats, self._song.bars)
         self._grid_vel  = add_lines(self.vel_plot, self._song.beats, self._song.bars)
-        self._grid_cc   = add_lines(self.cc_plot,  self._song.beats, self._song.bars)

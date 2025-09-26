@@ -104,6 +104,16 @@ def analyze_musicxml(path: str) -> ScoreAnalysis:
                         if wedge is not None:
                             wtype = wedge.attrib.get("type")
                             pa.directions.append(DirectionEvent(t_evt, "wedge", {"type": (wtype or "").strip()}))
+
+                        metr = F(dtyp, "metronome", ns)
+                        if metr is not None:
+                            per_min = F(metr, "per-minute", ns)
+                            if per_min is not None and per_min.text:
+                                try:
+                                    bpm = float(per_min.text.strip())
+                                    pa.directions.append(DirectionEvent(t_evt, "tempo", {"bpm": bpm}))
+                                except ValueError:
+                                    pass
                     continue
                 
                 # ---------------- NOTES ----------------

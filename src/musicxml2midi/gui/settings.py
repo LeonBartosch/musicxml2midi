@@ -35,19 +35,17 @@ def migrate_cfg(cfg: dict) -> dict:
         cc["curve"] = curve
         cfg[cc_key] = cc
 
-    # --- Phrasing defaults + Migration rel_beats -> rel_of_len
+    # --- Phrasing defaults ---
     phr = cfg.get("phrasing") or {}
     sl  = phr.get("slur_legato") or {}
     es  = sl.get("early_start") or {}
 
-    # Migration: rel_beats -> rel_of_len (falls alt)
-    if "rel_of_len" not in es and "rel_beats" in es:
-        es["rel_of_len"] = float(es.pop("rel_beats") or 0.05)
-
     sl.setdefault("enabled", True)
     sl.setdefault("overlap_ticks", 30)
-    es.setdefault("abs_ticks", 0)
-    es.setdefault("rel_of_len", 0.10)     # neu: anteilig an Notenlänge
+    # --- NEU: absolute/ms-Optionen (nur diese drei laut deiner Config) ---
+    es.setdefault("ms", 0)                       # early_start.ms
+    sl.setdefault("max_advance_ms", 120)         # absoluter Deckel in ms
+    sl.setdefault("longest_note_ms", 800)        # Orientierung für Advance
     sl["early_start"] = es
 
     tim = cfg.get("timing") or {}
@@ -65,8 +63,6 @@ def migrate_cfg(cfg: dict) -> dict:
     cfg["timing"] = tim
 
     # optional neue Keys mit sanften Defaults
-    sl.setdefault("guard_prev_onset_ticks", 0)
-    sl.setdefault("guard_next_onset_ticks", 0)
     sl.setdefault("max_advance_frac_of_prev_len", 0.0)
 
     # bereits vorhandene:
@@ -85,11 +81,7 @@ def migrate_cfg(cfg: dict) -> dict:
 
     # NEU: Skalenmodus + absolute Schwelle in Millisekunden
     # (Default-Werte gern anpassen)
-    sav.setdefault("scale_mode", "absolute")          # "absolute" | "relative"
     sav.setdefault("fullscale_ms", 160)               # ~1/3 Beat bei 120 BPM
-
-    # Relative Variante bleibt weiterhin verfügbar:
-    sav.setdefault("rel_of_len_fullscale", 0.10)
 
     sav.setdefault("min_vel", 31)
     sav.setdefault("max_vel", 105)
@@ -316,17 +308,6 @@ class SlurAdvanceVelocityPanel(QtWidgets.QGroupBox):
 
         form = QtWidgets.QFormLayout(self)
 
-        # NEU: Scale-Mode
-        self.cmb_scale = QtWidgets.QComboBox()
-        self.cmb_scale.addItems(["absolute", "relative"])
-        self.cmb_scale.setCurrentText(str(cfg.get("scale_mode", "absolute")).lower())
-        self.cmb_scale.setToolTip(
-            "Wie Advance → Velocity skaliert:\n"
-            "• absolute: fester Zeitwert in Millisekunden (fullscale_ms)\n"
-            "• relative: Anteil der eigenen Notenlänge (rel_of_len_fullscale)"
-        )
-        form.addRow("Scale mode:", self.cmb_scale)
-
         # NEU: absolute Schwelle (ms)
         self.spn_full_ms = QtWidgets.QSpinBox()
         self.spn_full_ms.setRange(1, 4000)   # 1..4000 ms (anpassbar)
@@ -338,13 +319,6 @@ class SlurAdvanceVelocityPanel(QtWidgets.QGroupBox):
             "Tempo- und Taktunabhängig, gut für DAW/Sample-Workflows."
         )
         form.addRow("Full-scale (absolute):", self.spn_full_ms)
-
-        # Relative Schwelle (Anteil der eigenen Länge)
-        self.dbl_full = QtWidgets.QDoubleSpinBox()
-        self.dbl_full.setRange(0.01, 1.0); self.dbl_full.setSingleStep(0.01); self.dbl_full.setDecimals(3)
-        self.dbl_full.setValue(float(cfg.get("rel_of_len_fullscale", 0.10)))
-        self.dbl_full.setToolTip("Relativer Vollskalen-Anteil der eigenen Notenlänge (0.10 = 10%).")
-        form.addRow("Full-scale (relative frac):", self.dbl_full)
 
         # Rest wie gehabt
         self.spn_min_vel = QtWidgets.QSpinBox()
@@ -369,23 +343,12 @@ class SlurAdvanceVelocityPanel(QtWidgets.QGroupBox):
         self.chk_first.setChecked(bool(cfg.get("include_first_note", False)))
         form.addRow(self.chk_first)
 
-        # Sichtbarkeit je nach Modus umschalten
-        def _toggle_mode_ui(mode: str):
-            abs_mode = (mode == "absolute")
-            self.spn_full_ms.setEnabled(abs_mode)
-            self.dbl_full.setEnabled(not abs_mode)
-
-        _toggle_mode_ui(self.cmb_scale.currentText().lower())
-        self.cmb_scale.currentTextChanged.connect(lambda _: _toggle_mode_ui(self.cmb_scale.currentText().lower()))
-
         self.setLayout(form)
 
     def result_cfg(self) -> Dict:
         return {
             "enabled": self.isChecked(),
-            "scale_mode": self.cmb_scale.currentText().lower(),
             "fullscale_ms": int(self.spn_full_ms.value()),
-            "rel_of_len_fullscale": float(self.dbl_full.value()),
             "min_vel": int(self.spn_min_vel.value()),
             "max_vel": int(self.spn_max_vel.value()),
             "gamma": float(self.dbl_gamma.value()),
@@ -453,23 +416,12 @@ class TimingSection(QtWidgets.QGroupBox):
         self.dbl_dur_frac.setValue(float(cfg.get("dur_jitter_frac_of_len", 0.15)))
         lay.addRow("Dur jitter (± frac of length):", self.dbl_dur_frac)
 
-        # Guards sichtbar machen:
-        self.spn_guard_prev = QtWidgets.QSpinBox(); self.spn_guard_prev.setRange(0, 5000)
-        self.spn_guard_prev.setValue(int(cfg.get("onset_guard_prev_ticks", 0)))
-        lay.addRow("Guard prev onset (ticks):", self.spn_guard_prev)
-
-        self.spn_guard_next = QtWidgets.QSpinBox(); self.spn_guard_next.setRange(0, 5000)
-        self.spn_guard_next.setValue(int(cfg.get("onset_guard_next_ticks", 0)))
-        lay.addRow("Guard next onset (ticks):", self.spn_guard_next)
-
     def result_cfg(self) -> Dict:
         return {
             "enabled": self.isChecked(),
             "seed": int(self.spn_seed.value()),
             "onset_jitter_frac_of_len": float(self.dbl_onset_frac.value()),
             "dur_jitter_frac_of_len": float(self.dbl_dur_frac.value()),
-            "onset_guard_prev_ticks": int(self.spn_guard_prev.value()),
-            "onset_guard_next_ticks": int(self.spn_guard_next.value()),
         }
     
 class PhrasingSection(QtWidgets.QGroupBox):
@@ -496,25 +448,21 @@ class PhrasingSection(QtWidgets.QGroupBox):
         self.spn_overlap.setValue(int(sl.get("overlap_ticks", 30)))
         f.addRow("Overlap (ticks):", self.spn_overlap)
 
-        self.spn_early_abs = QtWidgets.QSpinBox(); self.spn_early_abs.setRange(0, 2000)
-        self.spn_early_abs.setValue(int((sl.get("early_start") or {}).get("abs_ticks", 0)))
-        f.addRow("Early start abs (ticks):", self.spn_early_abs)
+        # --- NEU: Early start (ms) + Deckel/Kappung in ms ---
+        self.spn_early_ms = QtWidgets.QSpinBox(); self.spn_early_ms.setRange(0, 5000)
+        self.spn_early_ms.setValue(int((sl.get("early_start") or {}).get("ms", 0)))
+        self.spn_early_ms.setSuffix(" ms")
+        f.addRow("Early start abs (ms):", self.spn_early_ms)
 
-        self.dbl_early_rel = QtWidgets.QDoubleSpinBox(); self.dbl_early_rel.setDecimals(3)
-        self.dbl_early_rel.setRange(0.0, 1.0); self.dbl_early_rel.setSingleStep(0.01)
+        self.spn_max_adv_ms = QtWidgets.QSpinBox(); self.spn_max_adv_ms.setRange(0, 5000)
+        self.spn_max_adv_ms.setValue(int(sl.get("max_advance_ms", 120)))
+        self.spn_max_adv_ms.setSuffix(" ms")
+        f.addRow("Max advance (ms):", self.spn_max_adv_ms)
 
-        self.dbl_early_rel.setValue(float((sl.get("early_start") or {}).get("rel_of_len", 0.10)))
-        f.removeRow(2)  # alte Zeile, wenn du sicher umstellst (nur falls nötig)
-        f.addRow("Early start rel (of length):", self.dbl_early_rel)
-
-        # NEU: Guards & relativer Mindest-Overlap
-        self.spn_guard_prev = QtWidgets.QSpinBox(); self.spn_guard_prev.setRange(0, 5000)
-        self.spn_guard_prev.setValue(int(sl.get("guard_prev_onset_ticks", 0)))
-        f.addRow("Guard prev onset (ticks):", self.spn_guard_prev)
-
-        self.spn_guard_next = QtWidgets.QSpinBox(); self.spn_guard_next.setRange(0, 5000)
-        self.spn_guard_next.setValue(int(sl.get("guard_next_onset_ticks", 0)))
-        f.addRow("Guard next onset (ticks):", self.spn_guard_next)
+        self.spn_longest_ms = QtWidgets.QSpinBox(); self.spn_longest_ms.setRange(0, 20000)
+        self.spn_longest_ms.setValue(int(sl.get("longest_note_ms", 800)))
+        self.spn_longest_ms.setSuffix(" ms")
+        f.addRow("Longest note (ms):", self.spn_longest_ms)
 
         self.dbl_max_adv = QtWidgets.QDoubleSpinBox(); self.dbl_max_adv.setDecimals(3)
         self.dbl_max_adv.setRange(0.0, 1.0); self.dbl_max_adv.setSingleStep(0.01)
@@ -524,7 +472,7 @@ class PhrasingSection(QtWidgets.QGroupBox):
         lay.addWidget(grp_leg)
 
         # --- NEU: Mindestabstände (nicht geslurte) + Tenuto
-        grp_gap = QtWidgets.QGroupBox("Mindestabstände (gleicher Pitch, NICHT geslurt)", self)
+        grp_gap = QtWidgets.QGroupBox("Mindestabstände (NICHT geslurt)", self)
         g = QtWidgets.QFormLayout(grp_gap)
 
         self.spn_non_slur_gap = QtWidgets.QSpinBox(); self.spn_non_slur_gap.setRange(0, 2000)
@@ -546,11 +494,10 @@ class PhrasingSection(QtWidgets.QGroupBox):
                 "enabled": self.isChecked() and self.grp_leg.isChecked(),
                 "overlap_ticks": int(self.spn_overlap.value()),
                 "early_start": {
-                    "abs_ticks": int(self.spn_early_abs.value()),
-                    "rel_of_len": float(self.dbl_early_rel.value()),  # <— neu
+                    "ms": int(self.spn_early_ms.value()),
+                    "max_advance_ms": int(self.spn_max_adv_ms.value()),
+                    "longest_note_ms": int(self.spn_longest_ms.value()),
                 },
-                "guard_prev_onset_ticks": int(self.spn_guard_prev.value()),
-                "guard_next_onset_ticks": int(self.spn_guard_next.value()),
                 "max_advance_frac_of_prev_len": float(self.dbl_max_adv.value()),
                 "non_slur_min_gap_ticks": int(self.spn_non_slur_gap.value()),
                 "tenuto_min_gap_ticks": int(self.spn_tenuto_gap.value()),
@@ -876,9 +823,7 @@ class SettingsDialog(QtWidgets.QDialog):
         
         sav = (vel_cfg.get("slur_advance_velocity") or {}) or {}
         self.sec_vel.sav_panel.setChecked(bool(sav.get("enabled", True)))
-        self.sec_vel.sav_panel.cmb_scale.setCurrentText(str(sav.get("scale_mode", "absolute")).lower())
         self.sec_vel.sav_panel.spn_full_ms.setValue(int(sav.get("fullscale_ms", 160)))
-        self.sec_vel.sav_panel.dbl_full.setValue(float(sav.get("rel_of_len_fullscale", 0.10)))
 
         self.sec_vel.sav_panel.spn_min_vel.setValue(int(sav.get("min_vel", 31)))
         self.sec_vel.sav_panel.spn_max_vel.setValue(int(sav.get("max_vel", 105)))
@@ -892,24 +837,21 @@ class SettingsDialog(QtWidgets.QDialog):
         self.sec_timing.spn_seed.setValue(int(tim.get("seed", 2024)))
         self.sec_timing.dbl_onset_frac.setValue(float(tim.get("onset_jitter_frac_of_len", 0.25)))
         self.sec_timing.dbl_dur_frac.setValue(float(tim.get("dur_jitter_frac_of_len", 0.15)))
-        self.sec_timing.spn_guard_prev.setValue(int(tim.get("onset_guard_prev_ticks", 0)))
-        self.sec_timing.spn_guard_next.setValue(int(tim.get("onset_guard_next_ticks", 0)))
 
         # Phrasing
         phr = (cfg.get("phrasing") or {})
         sl  = (phr.get("slur_legato") or {})
+        es  = (sl.get("early_start") or {})
+
         self.sec_phras.setChecked(bool(sl.get("enabled", True)))
         self.sec_phras.grp_leg.setChecked(bool(sl.get("enabled", True)))
         self.sec_phras.spn_overlap.setValue(int(sl.get("overlap_ticks", 30)))
 
-        es = (sl.get("early_start") or {})
-        self.sec_phras.spn_early_abs.setValue(int(es.get("abs_ticks", 0)))
-        self.sec_phras.dbl_early_rel.setValue(float(es.get("rel_of_len", 0.10)))
+        self.sec_phras.spn_early_ms.setValue(int(es.get("ms", 0)))
+        self.sec_phras.spn_max_adv_ms.setValue(int(es.get("max_advance_ms", sl.get("max_advance_ms", 120))))
+        self.sec_phras.spn_longest_ms.setValue(int(es.get("longest_note_ms", sl.get("longest_note_ms", 800))))
 
-        self.sec_phras.spn_guard_prev.setValue(int(sl.get("guard_prev_onset_ticks", 0)))
-        self.sec_phras.spn_guard_next.setValue(int(sl.get("guard_next_onset_ticks", 0)))
         self.sec_phras.dbl_max_adv.setValue(float(sl.get("max_advance_frac_of_prev_len", 0.0)))
-
         self.sec_phras.spn_non_slur_gap.setValue(int(sl.get("non_slur_min_gap_ticks", 10)))
         self.sec_phras.spn_tenuto_gap.setValue(int(sl.get("tenuto_min_gap_ticks", 5)))
 
@@ -1040,7 +982,7 @@ class SettingsDialog(QtWidgets.QDialog):
     def apply_external_cfg(self, merged_cfg: dict):
         self._cfg = dict(merged_cfg or {})
         self._repopulate_from_cfg(self._cfg)
-
+        
     def result_cfg(self) -> Dict:
         """
         Liefert die *merged Sicht* der Einstellungen aus dem Dialog.
@@ -1048,10 +990,10 @@ class SettingsDialog(QtWidgets.QDialog):
         """
         out = dict(self._cfg)
         out["velocities"] = self.sec_vel.result_cfg()
-        out["dynamics"]   = dict(out["velocities"])
+        out["dynamics"]   = dict(out["velocities"])  # falls Altpfad noch gebraucht wird
         out["beat_accent"]= dict(out["velocities"].get("beat_accent", {}))
         out["cc1"]    = self.sec_cc1.result_cfg()
         out["cc11"]   = self.sec_cc11.result_cfg()
         out["timing"] = self.sec_timing.result_cfg()
-        out["phrasing"] = self.sec_phras.result_cfg()  # NEU
+        out["phrasing"] = self.sec_phras.result_cfg()  # enthält deinen slur_legato-Block inkl. ms-Felder
         return out
