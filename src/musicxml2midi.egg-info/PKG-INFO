@@ -1,0 +1,44 @@
+Metadata-Version: 2.4
+Name: musicxml2midi
+Version: 0.0.1
+Summary: MusicXML -> MIDI converter (clean, modular blueprint)
+Author: You
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: mido>=1.3.0
+Requires-Dist: streamlit>=1.36.0
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: pandas>=2.0.0
+
+# musicxml2midi (Blueprint)
+
+A clean, modular starter for a MusicXML -> MIDI converter with a two-pass design:
+1) **analyze**: parse the MusicXML per part and collect *all* events (notes, ties, slurs, articulations, dynamics, wedges, tempo, timesig).
+2) **process**: apply musical rules to produce a **timeline** of Note/CC events.
+3) **write**: render to MIDI (one file with conductor + tracks).
+
+> This blueprint ships with stubs and type-safe dataclasses so you can implement the logic yourself.
+
+## Quick start
+```bash
+# run in-place
+python -m musicxml2midi.cli --in examples/mini.musicxml --out out.mid
+```
+
+## Layout
+```
+src/musicxml2midi/
+  __init__.py
+  cli.py
+  config.py
+  analyze.py
+  process.py
+  timeline.py
+  write.py
+  util/
+    xml.py
+    time.py
+tests/
+examples/mini.musicxml
+config.default.yaml
+```

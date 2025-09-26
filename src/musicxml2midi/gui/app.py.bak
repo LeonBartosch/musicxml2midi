@@ -1,0 +1,641 @@
+from __future__ import annotations
+
+# Bootstrap
+import os, sys
+import math
+from pathlib import Path
+
+PROJ_ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SRC_DIR = os.path.join(PROJ_ROOT, "src")
+
+# Erst SRC_DIR nach vorne, PROJ_ROOT maximal ans Ende
+if os.path.isdir(SRC_DIR) and SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+if PROJ_ROOT not in sys.path:
+    sys.path.append(PROJ_ROOT)
+
+from typing import List, Tuple, Optional, Dict, DefaultDict
+from collections import defaultdict
+from PySide6 import QtWidgets, QtCore
+import pyqtgraph as pg
+
+from musicxml2midi.analyze import analyze_musicxml
+from musicxml2midi.process import build_timelines
+from musicxml2midi.config_manager import ConfigManager
+from musicxml2midi.timeline import TimelineBundle, TrackTimeline
+from musicxml2midi.config import load_config
+
+from musicxml2midi.gui.models import MidiSong, Note
+from musicxml2midi.gui.pianoroll import PianoRoll
+from musicxml2midi.gui.pianoroll_post import PostPanel
+from musicxml2midi.gui.settings import SettingsDialog
+
+# ---------- helpers ----------
+# ---- helper: map mark -> value (per_mark | linear), inkl. Hairpins ----
+
+def _value_from_mark_or_linear(cfg: Dict, mark: str, t: float,
+                               wedges_sec: List[Tuple[float, float, str]]) -> int:
+    """
+    Liefert einen 0..127-Wert anhand cfg:
+      - mode == 'per_mark': nimmt Wert aus per_mark oder fallback; clamp auf [linear_min, linear_max]
+      - mode == 'linear'  : mappt Marken-Ordnung ppp..fff in [linear_min, linear_max]
+                            + mit linear_hairpin_strength als moderater Beeinflussung in Hairpins
+    """
+    mode = (cfg.get("mode", "per_mark") or "per_mark").lower()
+
+    lin_min = int(cfg.get("linear_min", 0))
+    lin_max = int(cfg.get("linear_max", 127))
+    if lin_max < lin_min:
+        lin_min, lin_max = lin_max, lin_min
+
+    ORDER = ["ppp", "pp", "p", "mp", "mf", "f", "ff", "fff"]
+    idx = {m: i for i, m in enumerate(ORDER)}
+    denom = max(1, len(ORDER) - 1)
+
+    if mode == "per_mark":
+        pm = cfg.get("per_mark", {}) or {}
+        fb = int(cfg.get("fallback", 64))
+        v = int(pm.get(mark, fb))
+        # auch im per_mark-Modus auf das (lin_min, lin_max)-Fenster beschränken
+        return max(lin_min, min(lin_max, v))
+
+    # ---- linear ----
+    def rel_for_mark(m: str) -> float:
+        return (idx[m] / denom) if m in idx else float(cfg.get("linear_bias", 0.5))
+
+    base_rel = rel_for_mark(mark)
+
+    strength = float(cfg.get("linear_hairpin_strength", 0.25))
+    strength = max(0.0, min(1.0, strength))
+
+    # Prüfe, ob t in einem Hairpin liegt
+    p = None
+    k = None
+    for a, b, kind in wedges_sec:
+        if a <= t <= b and b > a:
+            p = (t - a) / (b - a)
+            k = kind
+            break
+
+    if p is not None:
+        if (k or "").startswith("cres"):
+            # nur Anteil 'strength' Richtung 1
+            rel = base_rel + strength * (1.0 - base_rel) * p
+        else:
+            # nur Anteil 'strength' Richtung 0
+            rel = base_rel * (1.0 - strength * p)
+    else:
+        rel = base_rel
+
+    rel = max(0.0, min(1.0, rel))
+    return int(round(lin_min + (lin_max - lin_min) * rel))
+
+def ticks_to_seconds_map(tempos: List[Tuple[int, float]], tpb: int):
+    tempos = sorted(tempos or [(0, 120.0)], key=lambda x: x[0])
+    segs = []
+    last_tick = 0; last_sec = 0.0; last_bpm = tempos[0][1]
+    for tick, bpm in tempos:
+        if tick > last_tick:
+            segs.append((last_tick, tick, last_sec, last_bpm))
+            last_sec += ((tick - last_tick) / tpb) * (60.0 / last_bpm)
+            last_tick = tick
+        last_bpm = bpm
+    segs.append((last_tick, 10**12, last_sec, last_bpm))
+    def to_sec(t: int) -> float:
+        for s0, s1, base, bpm in segs:
+            if s0 <= t < s1:
+                return base + ((t - s0) / tpb) * (60.0 / bpm)
+        s0, _, base, bpm = segs[-1]
+        return base + ((t - s0) / tpb) * (60.0 / bpm)
+    return to_sec
+
+def pair_wedges_to_spans(events: List[Tuple[int, str]]) -> List[Tuple[int,int,str]]:
+    spans = []
+    stack: List[Tuple[int,str]] = []
+    for t, typ in sorted(events, key=lambda x: x[0]):
+        if typ in ("crescendo", "diminuendo"):
+            stack.append((t, typ))
+        elif typ == "stop" and stack:
+            st, k = stack.pop()
+            if t > st:
+                spans.append((st, t, k))
+    return spans
+
+def _group_by_voice_staff(events) -> DefaultDict[Tuple[str,str], List]:
+    groups: DefaultDict[Tuple[str,str], List] = defaultdict(list)
+    for ev in events:
+        voice = str(ev.attrs.get("voice") or "")
+        staff = str(ev.attrs.get("staff") or "")
+        groups[(voice, staff)].append(ev)
+    for k in groups:
+        groups[k].sort(key=lambda e: (e.start_tick, e.end_tick, e.midi))
+    return groups
+
+# ---------- build "analysis" song ----------
+def build_song_from_bundle(bundle: TimelineBundle, part: TrackTimeline,
+                           dyn_events: List[Tuple[int, str]],
+                           wedge_spans: List[Tuple[int,int,str]]) -> MidiSong:
+    t2s = ticks_to_seconds_map(bundle.conductor.tempos, bundle.ticks_per_beat)
+
+    # --- Noten + Slur onset-basiert, chord-robust ---
+    notes: List[Note] = []
+    max_tick = 0
+    groups = _group_by_voice_staff(part.notes)
+
+    # Aggregation für Artikulations-Lane (optional dedupliziert pro onset in sec)
+    arts_by_tick: Dict[int, set] = {}
+
+    for (_voice, _staff), evs in groups.items():
+        onsets: Dict[int, List] = {}
+        for ev in evs:
+            onsets.setdefault(ev.start_tick, []).append(ev)
+        onset_ticks = sorted(onsets.keys())
+
+        slur_depth = 0
+        have_prev = False
+
+        for t in onset_ticks:
+            curr_evs = onsets[t]
+            curr_start_sum = sum(int(e.attrs.get("slur_start_n", 0)) for e in curr_evs)
+            curr_stop_sum  = sum(int(e.attrs.get("slur_stop_n",  0)) for e in curr_evs)
+            place_slur_here = (have_prev and slur_depth > 0 and curr_start_sum == 0)
+
+            onset_tags = set()
+            for ev in curr_evs:
+                onset_tags.update(ev.attrs.get("tags", []))
+            if place_slur_here:
+                onset_tags.add("slur")
+            if onset_tags:
+                arts_by_tick.setdefault(t, set()).update(onset_tags)
+
+            for ev in curr_evs:
+                s_tick, e_tick = ev.start_tick, ev.end_tick
+                s = t2s(s_tick); e = t2s(e_tick)
+                max_tick = max(max_tick, e_tick)
+                arts = list(ev.attrs.get("tags", []))
+                if place_slur_here: arts.append("slur")
+                # dedupe
+                seen = set(); arts = [a for a in arts if not (a in seen or seen.add(a))]
+                nobj = Note(pitch=ev.midi, start=s, end=e, velocity=ev.velocity, articulations=arts)
+                setattr(nobj, "start_tick", s_tick)   # dynamisch anhängen (sofern Note keine __slots__ hat)
+                notes.append(nobj)
+
+            have_prev = True
+            slur_depth += curr_start_sum
+            slur_depth = max(0, slur_depth - curr_stop_sum)
+
+    length = t2s(max_tick) if notes else 0.0
+    if wedge_spans:
+        length = max(length, t2s(max(b for _, b, _ in wedge_spans)))
+    if dyn_events:
+        length = max(length, t2s(max(t for t, _ in dyn_events)))
+    length = max(0.0, length) + 0.5
+
+    # Grid
+    beats_sec, bars_sec = [], []
+    ts = sorted(bundle.conductor.timesigs, key=lambda x: x[0]) or [(0, 4, 4)]
+    idx = 0; cur_tick = 0
+    while True:
+        num, den = ts[idx][1], ts[idx][2]
+        blen = int(round(bundle.ticks_per_beat * (4.0 / den)))
+        barlen = blen * num
+        bars_sec.append(t2s(cur_tick))
+        for b in range(num):
+            beats_sec.append(t2s(cur_tick + b * blen))
+        cur_tick += barlen
+        if idx + 1 < len(ts) and cur_tick >= ts[idx + 1][0]:
+            idx += 1
+        if t2s(cur_tick) > (length + 2.0):
+            break
+
+    dyn_times   = [(t2s(t), m) for (t, m) in sorted(dyn_events, key=lambda x: x[0])]
+    wedge_times = [(t2s(a), t2s(b), k) for (a,b,k) in wedge_spans]
+    ts_changes_sec: List[Tuple[float,int,int]] = [(t2s(t), n, d) for (t, n, d) in bundle.conductor.timesigs]
+
+    arts_time_list = sorted(((t2s(tick), sorted(list(tags))) for tick, tags in arts_by_tick.items()),
+                            key=lambda x: x[0])
+
+    return MidiSong(
+        name=part.name,
+        notes=notes,
+        length=length,
+        beats=beats_sec,
+        bars=bars_sec,
+        meta={
+            "dynamics": dyn_times,
+            "wedges": wedge_times,
+            "timesig_changes": ts_changes_sec,
+            "arts_by_time": arts_time_list,
+            # für PostPanel, falls du später Tick-genau brauchst:
+            "tpb": bundle.ticks_per_beat,
+            "tempos": bundle.conductor.tempos,
+        }
+    )
+
+def _nearest_prev_mark(dyn_marks: List[Tuple[float,str]], t: float) -> Optional[str]:
+    prev = None
+    for sec, mark in dyn_marks:
+        if sec <= t:
+            prev = mark
+        else:
+            break
+    return prev
+
+def _clamp(v, lo, hi): return max(lo, min(hi, v))
+
+def _note_phase_in_bar(tick: int, bar_start: int, tpb: int):
+    rel = tick - bar_start
+    phase = rel / float(tpb)
+    return phase, int(math.floor(phase + 1e-9))
+
+def _categorize_beat(phase: float, beat_idx: int, beats_per_bar: int, ba_cfg: dict) -> str:
+    tol_on = float(ba_cfg.get("tol_onbeat", 0.08))
+    tol_e8 = float(ba_cfg.get("tol_eighth", 0.08))
+    tol_s16 = float(ba_cfg.get("tol_sixteenth", 0.06))
+    frac = phase - math.floor(phase)
+    if abs(phase - round(phase)) <= tol_on and beat_idx == 0:
+        return "bar_downbeat"
+    if beats_per_bar % 2 == 0 and abs(phase - round(phase)) <= tol_on:
+        if beat_idx == (beats_per_bar // 2):
+            return "midbar_strong"
+    if abs(phase - round(phase)) <= tol_on:
+        return "onbeats_other"
+    if abs(frac - 0.5) <= tol_e8:
+        return "eighth_offbeats"
+    if abs(frac - 0.25) <= tol_s16 or abs(frac - 0.75) <= tol_s16:
+        return "sixteenth_offs"
+    return "fallback"
+
+def _apply_accent(v_in: int, cat: str, ba_cfg: dict) -> int:
+    rules = ba_cfg.get("rules", {})
+    r = rules.get(cat, rules.get("fallback", {"mul":1.0,"add":0}))
+    v = int(round(v_in * float(r.get("mul",1.0)) + int(r.get("add",0))))
+    return _clamp(v, int(ba_cfg.get("clamp_min",1)), int(ba_cfg.get("clamp_max",127)))
+
+def _apply_interpretation(bundle: TimelineBundle,
+                          analysis_song: MidiSong,
+                          dyn_events: List[Tuple[int, str]],
+                          wedge_spans: List[Tuple[int,int,str]],
+                          cfg: Dict) -> MidiSong:
+    """
+    Interpretation:
+      - Velocity je Note aus Config (per_mark|linear) + Artikulations-Offsets + Beat-Accent (wenn enabled)
+      - CC1/CC11 aus derselben Logik (per_mark|linear), inkl. Hairpin-Einfluss
+      - Enable-Schalter pro Sektion (velocities/cc1/cc11)
+    """
+    # Sekunden-Events vorbereiten
+    t2s = ticks_to_seconds_map(bundle.conductor.tempos, bundle.ticks_per_beat)
+    dyn_sec = sorted([(t2s(t), (m or "").lower()) for (t, m) in dyn_events], key=lambda x: x[0])
+    wedges_sec = [(t2s(a), t2s(b), k) for (a, b, k) in wedge_spans]
+    if not dyn_sec:
+        dyn_sec = [(0.0, "mf")]  # sinnvolle Basis, falls keine Marken im Stück
+
+    # Konfig-Sektionen
+    vel_cfg  = cfg.get("velocities", cfg.get("dynamics", {})) or {}
+    cc1_cfg  = cfg.get("cc1",  {}) or {}
+    cc11_cfg = cfg.get("cc11", {}) or {}
+
+    vel_enabled  = bool(vel_cfg.get("enabled",  True))
+    cc1_enabled  = bool(cc1_cfg.get("enabled",  True))
+    cc11_enabled = bool(cc11_cfg.get("enabled", True))
+
+    # Beat-Accent
+    ba_cfg = cfg.get("beat_accent", {}) or {}
+
+    # Hilfs-Lookups für Bar/Beat
+    timesigs = bundle.conductor.timesigs   # [(tick, num, den), ...]
+    tpb = bundle.ticks_per_beat
+
+    def _timesig_at(tick: int):
+        last = (0, 4, 4)
+        for t, num, den in timesigs:
+            if t <= tick:
+                last = (t, num, den)
+            else:
+                break
+        return last
+
+    def _bar_start_tick(ts_tick: int, num: int, den: int, tick: int) -> int:
+        beats_per_bar = int(num)
+        bar_len = beats_per_bar * tpb
+        rel = max(0, tick - ts_tick)
+        k = rel // bar_len
+        return ts_tick + int(k * bar_len)
+
+    # ---------- 1) Velocity je Note ----------
+    notes_out: List[Note] = []
+
+    for n in analysis_song.notes:
+        if not vel_enabled:
+            # Velocity shaping komplett aus → Original übernehmen (nur clamp)
+            vel = _clamp(int(getattr(n, "velocity", 64)), 1, 127)
+        else:
+            base_mark = _nearest_prev_mark(dyn_sec, n.start) or "mf"
+            base_vel  = _value_from_mark_or_linear(vel_cfg, base_mark, n.start, wedges_sec)
+
+            # Artikulations-Offsets
+            offs = 0
+            if "accent"   in (n.articulations or []): offs += 12
+            if "marcato"  in (n.articulations or []): offs += 18
+            if "staccato" in (n.articulations or []): offs -= 6
+            if "tenuto"   in (n.articulations or []): offs += 3
+            vel = _clamp(base_vel + offs, 1, 127)
+
+            # Metrische Akzente
+            if ba_cfg.get("enabled", True):
+                start_tick = getattr(n, "start_tick", 0)
+                ts_tick, num, den = _timesig_at(start_tick)
+                bar_start = _bar_start_tick(ts_tick, num, den, start_tick)
+                phase, beat_idx = _note_phase_in_bar(start_tick, bar_start, tpb)
+                beats_per_bar = int(num) if int(num) > 0 else 4
+                cat = _categorize_beat(phase, beat_idx, beats_per_bar, ba_cfg)
+                vel = _apply_accent(vel, cat, ba_cfg)
+
+        notes_out.append(Note(
+            pitch=n.pitch, start=n.start, end=n.end, velocity=vel, articulations=n.articulations
+        ))
+
+    # ---------- 2) CC-Kurven ----------
+    cc_map: Dict[int, List[Tuple[float,int]]] = {}
+
+    cc_default_A = 1   # Modwheel
+    cc_default_B = 11  # Expression
+
+    def add_cc_point(ccn: int, t: float, v: int):
+        cc_map.setdefault(ccn, [])
+        cc_map[ccn].append((float(t), int(_clamp(v, 0, 127))))
+
+    # Baseline & Hairpins sind in _value_from_mark_or_linear bereits berücksichtigt:
+    # Wir setzen Punkte an allen Dynamikmarken und (optional) an Hairpin-Enden,
+    # damit der Verlauf auch als Stützpunkte sichtbar ist.
+
+    # Helper: Werte für gegebenen Zeitpunkt t und vorheriger Marke an t
+    def _cc_value_at(cfg_section: Dict, t: float) -> int:
+        mark = _nearest_prev_mark(dyn_sec, t) or "mf"
+        return _value_from_mark_or_linear(cfg_section, mark, t, wedges_sec)
+
+    # Punkte an Marken
+    if cc1_enabled:
+        for sec, _mark in dyn_sec:
+            add_cc_point(cc_default_A, sec, _cc_value_at(cc1_cfg, sec))
+    if cc11_enabled:
+        for sec, _mark in dyn_sec:
+            add_cc_point(cc_default_B, sec, _cc_value_at(cc11_cfg, sec))
+
+    # (Optionale) Stützpunkte an Hairpin-Start/Ende – konsistent zur Baseline
+    for a, b, _kind in wedges_sec:
+        if b <= a:
+            continue
+        if cc1_enabled:
+            add_cc_point(cc_default_A, a, _cc_value_at(cc1_cfg, a))
+            add_cc_point(cc_default_A, b, _cc_value_at(cc1_cfg, b))
+        if cc11_enabled:
+            add_cc_point(cc_default_B, a, _cc_value_at(cc11_cfg, a))
+            add_cc_point(cc_default_B, b, _cc_value_at(cc11_cfg, b))
+
+    # sort & dedupe per cc
+    for ccn, pts in cc_map.items():
+        pts.sort(key=lambda x: x[0])
+        dedup = []
+        last = None
+        for t, v in pts:
+            if last is None or (abs(t - last[0]) > 1e-6 or v != last[1]):
+                dedup.append((t, v)); last = (t, v)
+        cc_map[ccn] = dedup
+
+    # Länge übernehmen
+    post = MidiSong(
+        name=analysis_song.name + " (MIDI)",
+        notes=notes_out,
+        length=analysis_song.length,
+        beats=analysis_song.beats,
+        bars=analysis_song.bars,
+        meta={"cc": cc_map}
+    )
+    return post
+
+# ---------- GUI ----------
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("musicxml2midi – Inspector (Analysis & MIDI)")
+        self.resize(1280, 900)
+
+        cw = QtWidgets.QWidget(); self.setCentralWidget(cw)
+        root = QtWidgets.QVBoxLayout(cw)
+
+        # --- Top toolbar ---
+        tbar = QtWidgets.QHBoxLayout()
+        self.btn_open = QtWidgets.QPushButton("Open MusicXML…")
+        self.btn_settings = QtWidgets.QPushButton("Settings…")
+        self.btn_apply = QtWidgets.QPushButton("Apply to MIDI")
+        self.btn_export = QtWidgets.QPushButton("Export MIDI")
+        self.btn_export.setEnabled(False)  # kommt später
+        tbar.addWidget(self.btn_open)
+        tbar.addWidget(self.btn_settings)
+        tbar.addWidget(self.btn_apply)
+        tbar.addWidget(self.btn_export)
+        tbar.addStretch(1)
+        root.addLayout(tbar)
+
+        # --- Split: left list, right panels (analysis+post) ---
+        main = QtWidgets.QHBoxLayout(); root.addLayout(main, 1)
+
+        left = QtWidgets.QWidget(); lv = QtWidgets.QVBoxLayout(left)
+        self.part_list = QtWidgets.QListWidget()
+        lv.addWidget(QtWidgets.QLabel("Parts"))
+        lv.addWidget(self.part_list, 1)
+
+        # Panels
+        self.roll = PianoRoll()                         # Analyse (oben)
+        self.post = PostPanel(embedded_controls=True)   # Interpretation (unten)
+
+        # Header oben
+        analysis_box = QtWidgets.QWidget()
+        analysis_v = QtWidgets.QVBoxLayout(analysis_box)
+        analysis_v.setContentsMargins(0,0,0,0)
+        analysis_v.addWidget(QtWidgets.QLabel("Analysis"))
+        analysis_v.addWidget(self.roll, 1)
+
+        # Header unten mit CC-Auswahl rechts
+        post_box = QtWidgets.QWidget()
+        post_v = QtWidgets.QVBoxLayout(post_box)
+        post_v.setContentsMargins(0,0,0,0)
+        post_hdr = QtWidgets.QHBoxLayout()
+        post_hdr.addWidget(QtWidgets.QLabel("Interpretation → MIDI"))
+        post_hdr.addStretch(1)
+        post_hdr.addWidget(self.post.cc_selector_widget())
+        post_v.addLayout(post_hdr)
+        post_v.addWidget(self.post, 1)
+
+        # --- Vertikaler Splitter: oben klein, unten groß ---
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(analysis_box)
+        splitter.addWidget(post_box)
+        splitter.setHandleWidth(8)
+
+        # Stretch-Faktoren (oben : unten = 1 : 3)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        # Initiale Größen (Pixel) – unten deutlich größer
+        splitter.setSizes([400, 600])
+
+        # Panels X-synchronisieren (oben<->unten)
+        self.post.roll.setXLink(self.roll.plot)
+
+        main.addWidget(left, 0)
+        main.addWidget(splitter, 1)
+
+        self.status = QtWidgets.QStatusBar(); self.setStatusBar(self.status)
+
+        # state
+        self.bundle: Optional[TimelineBundle] = None
+        self.parts_order: List[str] = []
+        self.dyn_by_part: Dict[str, List[Tuple[int, str]]] = {}
+        self.wedges_by_part: Dict[str, List[Tuple[int,int,str]]] = {}
+
+        # wiring
+        self.btn_open.clicked.connect(self.on_open)
+        self.part_list.itemSelectionChanged.connect(self.on_select_part)
+        self.btn_settings.clicked.connect(self.on_settings)
+        self.btn_apply.clicked.connect(self.on_apply_to_midi)
+        self.btn_export.clicked.connect(self.on_export)
+
+        PKG_ROOT = Path(__file__).resolve().parents[1]  # …/musicxml2midi
+        self.cfg = ConfigManager(
+            default_path=PKG_ROOT / "config.default.yaml",
+            user_path=Path.home() / ".config" / "musicxml2midi" / "config.yaml",
+        )
+        self.cfg.load()
+
+    # ---- file load & analysis ----
+    def on_open(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open MusicXML", "", "MusicXML (*.musicxml *.xml)")
+        if not path: return
+        self.load_file(path)
+
+    def load_file(self, path: str):
+        cfg = load_config(None)
+        score = analyze_musicxml(path)
+        self.bundle = build_timelines(score, cfg)
+
+        dyns: Dict[str, List[Tuple[int, str]]] = {}
+        wedges: Dict[str, List[Tuple[int,int,str]]] = {}
+        tpb = int(cfg.get("ticks_per_beat", 960))
+
+        for pid, pa in score.parts.items():
+            def to_tick(div_pos: int) -> int:
+                divs = 480
+                for td, dv in pa.divisions_changes:
+                    if td <= div_pos: divs = dv
+                    else: break
+                return int(round(div_pos * (tpb / max(1, divs))))
+
+            dls: List[Tuple[int,str]] = []
+            wraw: List[Tuple[int,str]] = []
+            for d in pa.directions:
+                if d.kind == "dynamic" and "mark" in d.payload:
+                    dls.append((to_tick(d.time_div), d.payload["mark"].lower()))
+                elif d.kind == "wedge" and "type" in d.payload:
+                    wraw.append((to_tick(d.time_div), d.payload["type"]))
+            dyns[pid] = sorted(dls, key=lambda x: x[0])
+            wedges[pid] = pair_wedges_to_spans(wraw)
+
+        self.dyn_by_part = dyns
+        self.wedges_by_part = wedges
+
+        self.parts_order = list(self.bundle.tracks.keys())
+        self.part_list.clear()
+        for pid in self.parts_order:
+            self.part_list.addItem(self.bundle.tracks[pid].name)
+        if self.parts_order:
+            self.part_list.setCurrentRow(0)
+            self.show_part(self.parts_order[0])
+
+        from os.path import basename
+        self.status.showMessage(f"Loaded {basename(path)} | parts={len(self.parts_order)}", 5000)
+
+    def on_select_part(self):
+        row = self.part_list.currentRow()
+        if 0 <= row < len(self.parts_order):
+            self.show_part(self.parts_order[row])
+
+    def show_part(self, pid: str):
+        if not self.bundle: return
+        track = self.bundle.tracks[pid]
+        dyns = self.dyn_by_part.get(pid, [])
+        wdg  = self.wedges_by_part.get(pid, [])
+        song = build_song_from_bundle(self.bundle, track, dyns, wdg)
+        self.roll.set_song(song)
+        # leere Interpretation unten anzeigen bis "Apply"
+        self.post.set_song(MidiSong(
+            name=song.name + " (MIDI)",
+            notes=[],
+            length=song.length,
+            beats=song.beats,
+            bars=song.bars,
+            meta={"cc": {}}
+        ))
+        self._current_pid = pid
+
+    # ---- actions ----
+    def on_settings(self):
+        dlg = SettingsDialog(self, cfg_dict=self.cfg.data)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            new_data = dlg.result_cfg()
+            self.cfg.replace(new_data)   # gegen Defaults mergen
+            self.cfg.save_user()         # nur Overrides speichern
+
+    def on_apply_to_midi(self):
+        idx = self.part_list.currentRow()
+        if idx < 0 or idx >= len(self.parts_order):
+            return
+        pid = self.parts_order[idx]
+        self.rebuild_post_for_part(pid)
+        self.statusBar().showMessage("Velocities applied (beat accents).", 2000)
+
+    def rebuild_post_for_part(self, pid: str):
+        if not self.bundle: return
+        track = self.bundle.tracks[pid]
+        dyns  = self.dyn_by_part.get(pid, [])
+        wedges = self.wedges_by_part.get(pid, [])
+
+        # Analysis-Song neu bauen (damit start_tick sicher dran ist)
+        analysis_song = build_song_from_bundle(self.bundle, track, dyns, wedges)
+
+        post_song = _apply_interpretation(
+            bundle=self.bundle,
+            analysis_song=analysis_song,
+            dyn_events=dyns,
+            wedge_spans=wedges,
+            cfg=self.cfg.data,   # zentrale Quelle!
+        )
+        # unten anzeigen
+        self.post.set_song(post_song)
+
+    def on_export(self):
+        # Platzhalter – folgt später
+        QtWidgets.QMessageBox.information(self, "Export MIDI", "Export folgt bald 🙂")
+        return
+
+def main():
+    pg.setConfigOptions(antialias=True)
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow(); w.show()
+
+    # --- Auto-Load für schnelle Tests ---
+    # Per ENV überschreibbar:  MX2M_AUTOLOAD=/pfad/zur/datei.musicxml
+    # Default: examples/mar.musicxml (falls vorhanden)
+    autoload = os.environ.get("MX2M_AUTOLOAD", "examples/mar.musicxml")
+    try:
+        if autoload and os.path.exists(autoload):
+            w.load_file(autoload)
+    except Exception as e:
+        # bewusst still – nur Debug-Print, damit GUI trotzdem startet
+        print("[autoload]", e)
+
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

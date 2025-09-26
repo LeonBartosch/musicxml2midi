@@ -1,0 +1,2 @@
+[console_scripts]
+musicxml2midi = musicxml2midi.cli:main
